@@ -13,5 +13,6 @@ mod import {
     pub(crate) use std::sync::Arc;
 }
 
+pub mod mpsc;
 pub mod spsc;
 pub mod triple_buffer;
