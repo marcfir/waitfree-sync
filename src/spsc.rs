@@ -217,6 +217,7 @@ impl<T> Receiver<T> {
 /// The async receiving side of the [spsc] queue which can be created with [Receiver::into_async].
 /// The `AsyncReceiver` uses internally a polling mechanism base on timerfd.
 #[cfg(feature = "async")]
+#[derive(Debug)]
 pub struct AsyncReceiver<T> {
     receiver: Receiver<T>,
     timer_fd: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
