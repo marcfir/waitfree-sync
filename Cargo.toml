@@ -15,8 +15,7 @@ categories = ["concurrency", "memory-management", "data-structures"]
 
 [dependencies]
 crossbeam-utils = "0.8"
-libc = { version = "0.2", optional = true }
-tokio = { version = "1.53", features = ["net", "rt"], optional = true }
+highres_async_timer = { version = "0.1.0", git = "ssh://git@github.com/novomation/highres_async_timer.git", optional = true }
 
 
 [dev-dependencies]
@@ -34,7 +33,7 @@ loom = "0.7"
 
 [features]
 default = ["async"]
-async = ["dep:libc", "dep:tokio"]
+async = ["dep:highres_async_timer"]
 
 [[bench]]
 name = "spsc"

@@ -8,7 +8,7 @@
 //! //                            Type ──╮   ╭─ Capacity
 //! let (mut tx, mut rx) = spsc::spsc::<u64>(8);
 //! tx.try_send(234);
-//! assert_eq!(rx.try_recv(),Some(234u64));
+//! assert_eq!(rx.try_recv(), Ok(234u64));
 //! ```
 //!
 //! # Behavior for full and empty queue.
@@ -19,7 +19,14 @@
 use crate::import::{Arc, AtomicBool, Ordering, UnsafeCell};
 use core::error::Error;
 use crossbeam_utils::CachePadded;
+#[cfg(feature = "async")]
+use highres_async_timer::HighResultionTimer;
 use std::{fmt::Debug, sync::atomic::AtomicUsize};
+#[cfg(feature = "async")]
+use std::{
+    task::{Context, Poll},
+    time::Duration,
+};
 
 /// Create a new wait-free SPSC queue. The `capacity` must be a power of two, which is validate during runtime.
 /// # Panic
@@ -51,11 +58,57 @@ const fn is_power_of_two(x: usize) -> bool {
 
 /// Indicates that a queue is full.
 #[derive(Clone, Debug, PartialEq)]
-pub struct NoSpaceLeftError<T>(T);
-impl<T: Debug> Error for NoSpaceLeftError<T> {}
-impl<T> core::fmt::Display for NoSpaceLeftError<T> {
+pub enum SendError<T> {
+    NoSpaceLeft(T),
+    ReceiverSideDropped(T),
+}
+impl<T: Debug> Error for SendError<T> {}
+impl<T> core::fmt::Display for SendError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "No space left in the SPSC queue.")
+        match self {
+            SendError::NoSpaceLeft(_) => write!(f, "No space left in the SPSC queue."),
+            SendError::ReceiverSideDropped(_) => {
+                write!(f, "Receiver side of the  SPSC queue dropped.")
+            }
+        }
+    }
+}
+impl<T> SendError<T> {
+    pub fn into_value(self) -> T {
+        match self {
+            SendError::NoSpaceLeft(val) => val,
+            SendError::ReceiverSideDropped(val) => val,
+        }
+    }
+}
+
+/// This enumeration is the list of the possible reasons that [Receiver::try_recv] could not return data when called.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TryRecvError {
+    /// This queue is currently empty, but the Sender(s) have not yet disconnected, so data may yet become available.
+    Empty,
+    /// The queues sending half has become disconnected, and there will never be any more data received on it.
+    Disconnected,
+}
+impl Error for TryRecvError {}
+impl core::fmt::Display for TryRecvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TryRecvError::Empty => write!(f, "No space left in the SPSC queue."),
+            TryRecvError::Disconnected => {
+                write!(f, "Receiver side of the  SPSC queue dropped.")
+            }
+        }
+    }
+}
+
+/// The recv operation can only fail if the sending half of a channel is disconnected and the queue is empty, implying that no further messages will ever be received.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecvError {}
+impl Error for RecvError {}
+impl core::fmt::Display for RecvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Receiver side of the  SPSC queue dropped.")
     }
 }
 
@@ -81,6 +134,7 @@ struct Spsc<T> {
     mask: usize,
     read: CachePadded<AtomicUsize>,
     write: CachePadded<AtomicUsize>,
+    alive_counter: CachePadded<AtomicUsize>,
 }
 
 impl<T> Spsc<T> {
@@ -95,6 +149,7 @@ impl<T> Spsc<T> {
             mask: size - 1,
             read: CachePadded::new(0.into()),
             write: CachePadded::new(0.into()),
+            alive_counter: CachePadded::new(2.into()),
         }
     }
 
@@ -124,16 +179,25 @@ impl<T> Receiver<T> {
         Receiver { spsc }
     }
 }
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        self.spsc.alive_counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 impl<T> Receiver<T> {
     /// Retrieve the next available element from the queue.
     /// Returns [None] if the queue is empty.
-    pub fn try_recv(&mut self) -> Option<T> {
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         let read = self.spsc.read.load(Ordering::Relaxed);
         let rpos = read & self.spsc.mask;
         let slot = unsafe { self.spsc.mem.get_unchecked(rpos) };
         if !slot.occupied.load(Ordering::Acquire) {
-            None
+            if self.spsc.alive_counter.load(Ordering::Relaxed) < 2 {
+                Err(TryRecvError::Disconnected)
+            } else {
+                Err(TryRecvError::Empty)
+            }
         } else {
             #[cfg(not(loom))]
             let val = unsafe { slot.value.get().replace(None) };
@@ -145,7 +209,7 @@ impl<T> Receiver<T> {
             self.spsc
                 .read
                 .store(read.wrapping_add(1), Ordering::Relaxed);
-            val
+            Ok(val.unwrap())
         }
     }
     /// Peeks the next element in the queue without removing it.
@@ -194,23 +258,16 @@ impl<T> Receiver<T> {
     /// # Errors
     /// Returns an [std::io::Error] if the underlying timer could not be created or configured.
     #[cfg(feature = "async")]
-    pub async fn into_async(self) -> Result<AsyncReceiver<T>, std::io::Error> {
-        use libc::{timerfd_create, CLOCK_MONOTONIC};
-        use std::os::fd::{FromRawFd, OwnedFd};
-        use tokio::io::unix::AsyncFd;
+    pub async fn into_async(
+        self,
+        poll_intervall: Duration,
+    ) -> Result<AsyncReceiver<T>, std::io::Error> {
+        let timer = HighResultionTimer::interval(poll_intervall)?;
 
-        let timer_fd = unsafe { timerfd_create(CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
-        if timer_fd == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        let timer_fd = unsafe { OwnedFd::from_raw_fd(timer_fd) };
-        let mut async_receiver = AsyncReceiver {
+        Ok(AsyncReceiver {
             receiver: self,
-            timer_fd: AsyncFd::new(timer_fd)?,
-        };
-        async_receiver.set_polling_rate(2000)?;
-        Ok(async_receiver)
+            timer,
+        })
     }
 }
 
@@ -220,58 +277,64 @@ impl<T> Receiver<T> {
 #[derive(Debug)]
 pub struct AsyncReceiver<T> {
     receiver: Receiver<T>,
-    timer_fd: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    timer: HighResultionTimer,
 }
 #[cfg(feature = "async")]
 impl<T> AsyncReceiver<T> {
     /// Asynchronously waits for and returns the next available element from the queue.
     /// This polls the queue at the configured polling rate (see [AsyncReceiver::set_polling_rate])
     /// until an element becomes available.
-    pub async fn recv(&mut self) -> T {
+    pub async fn recv(&mut self) -> Result<T, RecvError> {
         loop {
-            if let Some(val) = self.receiver.try_recv() {
-                return val;
+            match self.receiver.try_recv() {
+                Ok(val) => return Ok(val),
+                Err(TryRecvError::Disconnected) => return Err(RecvError {}),
+                Err(_) => (),
             }
-            if let Ok(guard) = self.timer_fd.readable().await {
-                use std::os::fd::AsRawFd;
-
-                let mut buf = [0u8; 8];
-                let _ = unsafe {
-                    use std::ffi::c_void;
-                    libc::read(
-                        guard.get_inner().as_raw_fd(),
-                        &raw mut buf as *mut c_void,
-                        buf.len(),
-                    )
-                };
-            }
+            self.timer.tick().await;
         }
     }
-    /// Sets the interval, in microseconds, at which the [AsyncReceiver] polls the queue for new elements.
-    /// # Errors
-    /// Returns an [std::io::Error] if the underlying timer could not be reconfigured.
-    pub fn set_polling_rate(&mut self, rate_us: u64) -> Result<(), std::io::Error> {
-        use libc::itimerspec;
-        use libc::timerfd_settime;
-        use std::os::fd::AsRawFd;
 
-        let mut ts: itimerspec = unsafe { core::mem::zeroed() };
-
-        let cycletime_ns = rate_us as i64 * 1000;
-        // First expiration after 1 second
-        ts.it_value.tv_sec = 0;
-        ts.it_value.tv_nsec = cycletime_ns;
-
-        // Then every 500 ms
-        ts.it_interval.tv_sec = 0;
-        ts.it_interval.tv_nsec = cycletime_ns;
-        let ret =
-            unsafe { timerfd_settime(self.timer_fd.as_raw_fd(), 0, &ts, core::ptr::null_mut()) };
-
-        if ret == -1 {
-            return Err(std::io::Error::last_os_error());
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        match self.receiver.try_recv() {
+            Ok(val) => Poll::Ready(Some(val)),
+            Err(TryRecvError::Disconnected) => Poll::Ready(None),
+            Err(_) => {
+                let _ = self.timer.poll_tick(cx);
+                Poll::Pending
+            }
         }
-        Ok(())
+
+        // self.timer.poll_tick();
+    }
+
+    /// Returns the total number of items that the queue can hold at most.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        // SAFETY: This is safe because we only read size which is never written.
+        self.receiver.spsc.capacity()
+    }
+
+    /// Returns the number of items in the queue.
+    /// # WARNING
+    /// This length is only a best-effort estimate.
+    /// It is computed from relaxed atomic and is NOT a linearizable value.
+    /// It may be temporarily incorrect (including over/under-counting) due to
+    /// reordering and visibility delays across threads.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.receiver.spsc.len()
+    }
+
+    /// Returns true if the queue is empty.
+    /// # WARNING
+    /// This length is only a best-effort estimate.
+    /// It is computed from relaxed atomic and is NOT a linearizable value.
+    /// It may be temporarily incorrect (including over/under-counting) due to
+    /// reordering and visibility delays across threads.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.receiver.spsc.len() == 0
     }
 }
 
@@ -287,17 +350,26 @@ impl<T> Sender<T> {
         Sender { spsc }
     }
 }
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        self.spsc.alive_counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 impl<T> Sender<T> {
     /// Attempts to send a value to the queue without blocking.
     /// Returns a [NoSpaceLeftError] if the queue is full.
-    pub fn try_send(&mut self, data: T) -> Result<(), NoSpaceLeftError<T>> {
+    pub fn try_send(&mut self, data: T) -> Result<(), SendError<T>> {
         let write = self.spsc.write.load(Ordering::Relaxed);
         let wpos = write & self.spsc.mask;
 
+        if self.spsc.alive_counter.load(Ordering::Relaxed) < 2 {
+            return Err(SendError::ReceiverSideDropped(data));
+        }
+
         let slot = unsafe { self.spsc.mem.get_unchecked(wpos) };
         if slot.occupied.load(Ordering::Acquire) {
-            Err(NoSpaceLeftError(data))
+            Err(SendError::NoSpaceLeft(data))
         } else {
             #[cfg(not(loom))]
             unsafe {
@@ -363,10 +435,10 @@ mod test {
         w.try_send(vec![0; 17]).unwrap();
         w.try_send(vec![0; 18]).unwrap();
 
-        assert_eq!(r.try_recv(), Some(vec![0; 15]));
-        assert_eq!(r.try_recv(), Some(vec![0; 16]));
-        assert_eq!(r.try_recv(), Some(vec![0; 17]));
-        assert_eq!(r.try_recv(), Some(vec![0; 18]));
+        assert_eq!(r.try_recv(), Ok(vec![0; 15]));
+        assert_eq!(r.try_recv(), Ok(vec![0; 16]));
+        assert_eq!(r.try_recv(), Ok(vec![0; 17]));
+        assert_eq!(r.try_recv(), Ok(vec![0; 18]));
     }
 
     #[test]
@@ -402,37 +474,49 @@ mod test {
         assert_eq!(write.len(), 3);
         assert_eq!(write.try_send(4), Ok(()));
         assert_eq!(write.len(), 4);
-        assert_eq!(write.try_send(5), Err(NoSpaceLeftError(5)));
+        assert_eq!(write.try_send(5), Err(SendError::NoSpaceLeft(5)));
         assert_eq!(write.len(), 4);
 
-        assert_eq!(read.try_recv(), Some(1));
+        assert_eq!(read.try_recv(), Ok(1));
         assert_eq!(write.len(), 3);
         assert_eq!(write.try_send(6), Ok(()));
         assert_eq!(write.len(), 4);
-        assert_eq!(read.try_recv(), Some(2));
+        assert_eq!(read.try_recv(), Ok(2));
         assert_eq!(write.len(), 3);
-        assert_eq!(read.try_recv(), Some(3));
+        assert_eq!(read.try_recv(), Ok(3));
         assert_eq!(write.len(), 2);
-        assert_eq!(read.try_recv(), Some(4));
+        assert_eq!(read.try_recv(), Ok(4));
         assert_eq!(write.len(), 1);
-        assert_eq!(read.try_recv(), Some(6));
-        assert_eq!(read.try_recv(), None);
+        assert_eq!(read.try_recv(), Ok(6));
+        assert_eq!(read.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[test]
-    fn test_drop_one_side() {
+    fn test_drop_read_side() {
         let (mut write, read) = spsc::<i32>(4);
-        drop(read);
+
         assert_eq!(write.try_send(1), Ok(()));
         assert_eq!(write.len(), 1);
         assert_eq!(write.try_send(2), Ok(()));
         assert_eq!(write.len(), 2);
-        assert_eq!(write.try_send(3), Ok(()));
-        assert_eq!(write.len(), 3);
-        assert_eq!(write.try_send(4), Ok(()));
-        assert_eq!(write.len(), 4);
-        assert_eq!(write.try_send(5), Err(NoSpaceLeftError(5)));
-        assert_eq!(write.len(), 4);
+        drop(read);
+        assert_eq!(write.try_send(3), Err(SendError::ReceiverSideDropped(3)));
+        assert_eq!(write.len(), 2);
+        assert_eq!(write.try_send(4), Err(SendError::ReceiverSideDropped(4)));
+        assert_eq!(write.len(), 2);
+        assert_eq!(write.try_send(5), Err(SendError::ReceiverSideDropped(5)));
+        assert_eq!(write.len(), 2);
+    }
+
+    #[test]
+    fn test_drop_write_side() {
+        let (mut write, mut read) = spsc::<i32>(4);
+
+        write.try_send(0).unwrap();
+        write.try_send(1).unwrap();
+        assert_eq!(read.try_recv(), Ok(0));
+        drop(write);
+        assert_eq!(read.try_recv(), Ok(1));
     }
 
     #[test]
@@ -444,15 +528,15 @@ mod test {
         w.try_send(vec![0; 18]).unwrap();
 
         assert_eq!(r.peek(), Some(&vec![0; 15]));
-        assert_eq!(r.try_recv(), Some(vec![0; 15]));
+        assert_eq!(r.try_recv(), Ok(vec![0; 15]));
         assert_eq!(r.peek(), Some(&vec![0; 16]));
-        assert_eq!(r.try_recv(), Some(vec![0; 16]));
+        assert_eq!(r.try_recv(), Ok(vec![0; 16]));
         assert_eq!(r.peek(), Some(&vec![0; 17]));
-        assert_eq!(r.try_recv(), Some(vec![0; 17]));
+        assert_eq!(r.try_recv(), Ok(vec![0; 17]));
         assert_eq!(r.peek(), Some(&vec![0; 18]));
         assert_eq!(r.peek(), Some(&vec![0; 18]));
         assert_eq!(r.peek(), Some(&vec![0; 18]));
-        assert_eq!(r.try_recv(), Some(vec![0; 18]));
+        assert_eq!(r.try_recv(), Ok(vec![0; 18]));
         assert_eq!(r.peek(), None);
     }
 
@@ -468,7 +552,8 @@ mod test {
         });
         let reader_thread = thread::spawn(move || {
             thread::park();
-            for _ in 0..4 {
+            let mut i = 0;
+            while i < 4 {
                 if let Some(val) = receiver.peek() {
                     let first_entry = val[0];
                     for entry in val {
@@ -479,6 +564,7 @@ mod test {
                     for entry in val {
                         assert_eq!(entry, first_entry);
                     }
+                    i += 1;
                 }
             }
         });
@@ -507,11 +593,11 @@ mod test {
             let notify = notify.clone();
             async move {
                 println!("now running on a worker thread");
-                let mut receiver = receiver.into_async().await.unwrap();
-                receiver.set_polling_rate(1000).unwrap();
+                let mut receiver = receiver.into_async(Duration::from_millis(1)).await.unwrap();
+
                 notify.notified().await;
                 for i in 0..1000 {
-                    assert_eq!(receiver.recv().await, [i; 50]);
+                    assert_eq!(receiver.recv().await, Ok([i; 50]));
                 }
             }
         });

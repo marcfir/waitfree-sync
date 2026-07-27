@@ -107,9 +107,11 @@ fn test_heapdata_multithread<E: PartialEq + Debug>(
     });
     let reader_thread = thread::spawn(move || {
         thread::park();
-        for _ in 0..COUNT {
+        let mut i = 0;
+        while i < COUNT {
             if let Some(val) = reader.read() {
                 assert_eq!(val.inner_field, vec![Some(SomeEnum::State1)]);
+                i += 1;
             }
         }
     });
